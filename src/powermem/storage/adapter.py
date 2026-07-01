@@ -15,11 +15,21 @@ from powermem.utils.utils import serialize_datetime, get_current_datetime
 
 logger = logging.getLogger(__name__)
 
+_FILTER_VALUE_MISSING = object()
+
 
 class StorageAdapter:
     """Adapter that bridges VectorStoreBase interface with Memory class expectations."""
 
     _SYSTEM_FILTER_KEYS = {"user_id", "agent_id", "run_id"}
+    # Promoted payload fields addressed by bare filter keys on nested stores
+    # (SQLite / PGVector). On OceanBase-like stores bare keys map to the top-level
+    # payload instead; see _metadata_filter_key_for_store().
+    #
+    # hash/data are intentionally excluded from this set: on nested stores unqualified
+    # hash/data filters target metadata.{key}; on OceanBase they target the top-level
+    # payload field. Use payload.hash / payload.data or metadata.hash / metadata.data
+    # when you need explicit cross-store semantics.
     _PAYLOAD_FILTER_KEYS = {
         "actor_id",
         "category",
@@ -132,17 +142,83 @@ class StorageAdapter:
                     db_filters[db_key] = value
         return db_filters
 
-    def _memory_matches_filter(self, memory: Dict[str, Any], key: str, expected: Any) -> bool:
+    def _normalized_filter_value(
+        self,
+        memory: Dict[str, Any],
+        db_key: str,
+    ) -> Any:
+        """Read a translated filter key from a normalized memory row."""
+        if db_key.startswith("metadata."):
+            metadata = memory.get("metadata")
+            if not isinstance(metadata, dict):
+                return _FILTER_VALUE_MISSING
+            nested_key = db_key[len("metadata."):]
+            if nested_key not in metadata:
+                return _FILTER_VALUE_MISSING
+            return metadata[nested_key]
+
+        if db_key not in memory:
+            return _FILTER_VALUE_MISSING
+        return memory[db_key]
+
+    def _filter_match_view_from_payload(
+        self,
+        payload: Dict[str, Any],
+        *,
+        memory_id: Any,
+        created_at: Any,
+        updated_at: Any,
+    ) -> Dict[str, Any]:
+        """Build an internal row shape for list post-filter matching only."""
+        return {
+            "id": memory_id,
+            "memory": payload.get("data", ""),
+            "data": payload.get("data", ""),
+            "hash": payload.get("hash"),
+            "user_id": payload.get("user_id"),
+            "agent_id": payload.get("agent_id"),
+            "run_id": payload.get("run_id"),
+            "category": payload.get("category"),
+            "actor_id": payload.get("actor_id"),
+            "role": payload.get("role"),
+            "type": payload.get("type"),
+            "metadata": payload.get("metadata", {}),
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+
+    def _memory_matches_filter(
+        self,
+        memory: Dict[str, Any],
+        key: str,
+        expected: Any,
+        target_store: Optional[VectorStoreBase] = None,
+    ) -> bool:
         """Match logical filters against normalized memory payloads."""
-        if key.startswith("payload."):
-            key = key[len("payload."):]
-        actual = memory.get(key)
-        metadata = memory.get("metadata")
-        if actual is None and isinstance(metadata, dict):
-            if key.startswith("metadata."):
-                actual = metadata.get(key[len("metadata."):])
-            if actual is None:
-                actual = metadata.get(key)
+        if key.startswith("metadata."):
+            metadata = memory.get("metadata")
+            if not isinstance(metadata, dict):
+                return False
+            nested_key = key[len("metadata."):]
+            if nested_key not in metadata:
+                return False
+            return metadata[nested_key] == expected
+
+        db_key = self._metadata_filter_key_for_store(key, target_store)
+        actual = self._normalized_filter_value(memory, db_key)
+        if actual is _FILTER_VALUE_MISSING:
+            metadata = memory.get("metadata")
+            if (
+                isinstance(metadata, dict)
+                and key not in self._PAYLOAD_FILTER_KEYS
+                and key not in self._SYSTEM_FILTER_KEYS
+                and not key.startswith("payload.")
+                and key in metadata
+            ):
+                actual = metadata[key]
+
+        if actual is _FILTER_VALUE_MISSING:
+            return False
         return actual == expected
 
     def add_memory(self, memory_data: Dict[str, Any]) -> int:
@@ -454,7 +530,7 @@ class StorageAdapter:
             
             memory = {
                 "id": memory_id,
-                "memory": content, 
+                "memory": content,
                 "created_at": created_at,
                 "updated_at": updated_at,
                 "score": score,
@@ -746,6 +822,12 @@ class StorageAdapter:
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
+            filter_view = self._filter_match_view_from_payload(
+                payload,
+                memory_id=memory_id,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
             
             # Apply filters (as double-check if database didn't filter)
             # Note: If filters were applied at database level, these will all pass
@@ -760,7 +842,12 @@ class StorageAdapter:
                 for key, expected in filters.items():
                     if key in ("user_id", "agent_id", "run_id"):
                         continue
-                    if not self._memory_matches_filter(memory, key, expected):
+                    if not self._memory_matches_filter(
+                        filter_view,
+                        key,
+                        expected,
+                        target_store=self.vector_store,
+                    ):
                         break
                 else:
                     pass  # all extra filters matched
