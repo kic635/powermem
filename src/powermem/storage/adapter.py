@@ -94,6 +94,14 @@ class StorageAdapter:
             return bool(getattr(target_store, "hybrid_search", False))
         return False
 
+    def _oceanbase_like_store(self, store: VectorStoreBase) -> bool:
+        """Return whether filters should follow OceanBase flat-table semantics."""
+        return ".oceanbase." in store.__class__.__module__
+
+    def _oceanbase_text_field(self, store: VectorStoreBase) -> str:
+        """Return the OceanBase column name used for memory text content."""
+        return getattr(store, "text_field", "document")
+
     def _metadata_filter_key_for_store(
         self,
         key: str,
@@ -106,17 +114,23 @@ class StorageAdapter:
             store_module.endswith("sqlite.sqlite_vector_store")
             or ".pgvector." in store_module
         )
+        oceanbase_like_store = self._oceanbase_like_store(store)
 
         if key in self._SYSTEM_FILTER_KEYS:
             return key
         if key.startswith("payload."):
-            return key[len("payload."):]
+            bare_key = key[len("payload."):]
+            if oceanbase_like_store and bare_key == "data":
+                return self._oceanbase_text_field(store)
+            return bare_key
         if key in self._PAYLOAD_FILTER_KEYS:
             return key
         if key.startswith("metadata."):
-            return key if payload_nested_store else key[len("metadata."):]
+            return key if (payload_nested_store or oceanbase_like_store) else key[len("metadata."):]
         if payload_nested_store:
             return f"metadata.{key}"
+        if oceanbase_like_store and key == "data":
+            return self._oceanbase_text_field(store)
         return key
 
     def _build_db_filters(
@@ -170,10 +184,12 @@ class StorageAdapter:
         updated_at: Any,
     ) -> Dict[str, Any]:
         """Build an internal row shape for list post-filter matching only."""
+        text_content = payload.get("data", "")
         return {
             "id": memory_id,
-            "memory": payload.get("data", ""),
-            "data": payload.get("data", ""),
+            "memory": text_content,
+            "data": text_content,
+            "document": text_content,
             "hash": payload.get("hash"),
             "user_id": payload.get("user_id"),
             "agent_id": payload.get("agent_id"),
@@ -558,9 +574,29 @@ class StorageAdapter:
                 if "_fts_score" in payload:
                     explanation["fts_score"] = payload.get("_fts_score")
                 memory["metadata"]["search_explanation"] = explanation
-            
-            # No need to apply filters here - filters are already applied at the database level
-            # in vector_store.search(), so all returned results should already match the filters
+
+            if filters:
+                filter_view = self._filter_match_view_from_payload(
+                    payload,
+                    memory_id=memory_id,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+                for key, expected in filters.items():
+                    if key in ("user_id", "agent_id", "run_id"):
+                        continue
+                    if not self._memory_matches_filter(
+                        filter_view,
+                        key,
+                        expected,
+                        target_store=target_store,
+                    ):
+                        break
+                else:
+                    memories.append(memory)
+                    continue
+                continue
+
             memories.append(memory)
         
         return memories[:limit]
@@ -867,7 +903,13 @@ class StorageAdapter:
         filters: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Count all memories with optional filtering."""
-        db_filters = self._build_db_filters(user_id, agent_id, run_id, filters)
+        db_filters = self._build_db_filters(
+            user_id,
+            agent_id,
+            run_id,
+            filters,
+            target_store=self.vector_store,
+        )
 
         try:
             if hasattr(self.vector_store, "count"):

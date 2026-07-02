@@ -1,8 +1,9 @@
 """
 Regression coverage for issue #1093: metadata vs top-level payload filter key collisions.
 
-SQLite: end-to-end count/list/search. OceanBase/PGVector: _build_db_filters and
-_memory_matches_filter via lightweight backend stubs (no real DB instances).
+SQLite: end-to-end count/list/search. OceanBase: adapter translation plus real
+_generate_where_clause() column-first behavior (mock table, no live DB).
+PGVector: _build_db_filters via lightweight backend stubs.
 """
 
 import pytest
@@ -144,6 +145,7 @@ def _agent_collision_memory() -> dict:
     return {
         "memory": COLLISION_CONTENT,
         "data": COLLISION_CONTENT,
+        "document": COLLISION_CONTENT,
         "category": PAYLOAD_CATEGORY,
         "hash": PAYLOAD_HASH,
         "actor_id": PAYLOAD_ACTOR_ID,
@@ -259,14 +261,9 @@ def test_sqlite_system_scope_keys_coexist_with_metadata_filters(sqlite_adapter):
     }
 
 
-def test_oceanbase_collision_keys_keep_plain_keys_at_top_level():
+def test_oceanbase_collision_keys_keep_plain_and_metadata_filters_distinct():
     adapter = _oceanbase_adapter()
 
-    # NOTE: metadata.hash / metadata.category are silently dropped here because
-    # OceanBase maps both plain and metadata-prefixed keys to the same top-level
-    # db key. _build_db_filters keeps the first value only (Python 3.7+ dict
-    # insertion order). This is dangerous silent behavior; upstream may want a
-    # warning when a later filter key collides with an existing db key.
     assert adapter._build_db_filters(
         filters={
             "hash": PAYLOAD_HASH,
@@ -279,10 +276,12 @@ def test_oceanbase_collision_keys_keep_plain_keys_at_top_level():
         },
     ) == {
         "hash": PAYLOAD_HASH,
-        "data": COLLISION_CONTENT,
+        "document": COLLISION_CONTENT,
         "category": PAYLOAD_CATEGORY,
         "created_at": PAYLOAD_CREATED_AT,
         "updated_at": PAYLOAD_UPDATED_AT,
+        "metadata.hash": METADATA_HASH,
+        "metadata.category": METADATA_CATEGORY,
     }
 
 
@@ -297,23 +296,20 @@ def test_oceanbase_payload_prefix_strips_to_top_level_key():
         },
     ) == {
         "hash": PAYLOAD_HASH,
-        "data": COLLISION_CONTENT,
+        "document": COLLISION_CONTENT,
         "category": PAYLOAD_CATEGORY,
     }
 
 
-def test_oceanbase_build_db_filters_first_write_wins_on_colliding_keys():
+def test_oceanbase_build_db_filters_keeps_metadata_and_plain_collision_keys():
     adapter = _oceanbase_adapter()
 
-    first = adapter._build_db_filters(
+    assert adapter._build_db_filters(
         filters={"category": PAYLOAD_CATEGORY, "metadata.category": METADATA_CATEGORY},
-    )
-    second = adapter._build_db_filters(
-        filters={"metadata.category": METADATA_CATEGORY, "category": PAYLOAD_CATEGORY},
-    )
-
-    assert first == {"category": PAYLOAD_CATEGORY}
-    assert second == {"category": METADATA_CATEGORY}
+    ) == {
+        "category": PAYLOAD_CATEGORY,
+        "metadata.category": METADATA_CATEGORY,
+    }
 
 
 def test_pgvector_adapter_translates_collision_keys_like_sqlite():
@@ -586,3 +582,84 @@ def test_sqlite_search_distinguishes_payload_and_metadata_collision_keys(sqlite_
     assert _memory_texts(search(**common, filters={"type": PAYLOAD_TYPE})) == [COLLISION_CONTENT]
     assert _memory_texts(search(**common, filters={"metadata.type": METADATA_TYPE})) == [COLLISION_CONTENT]
     assert _memory_texts(search(**common, filters={"category": "nonexistent"})) == []
+
+
+# ------------------------------------------------------------------ #
+# OceanBase: real _generate_where_clause column-first behavior
+# ------------------------------------------------------------------ #
+
+
+@pytest.fixture
+def oceanbase_where_store():
+    """OceanBaseVectorStore with real table schema; no live database connection."""
+    pytest.importorskip("pyobvector")
+    from powermem.storage.oceanbase.models import create_memory_model
+    from powermem.storage.oceanbase.oceanbase import OceanBaseVectorStore
+
+    store = OceanBaseVectorStore.__new__(OceanBaseVectorStore)
+    store.metadata_field = "metadata"
+    store.text_field = "document"
+    model = create_memory_model("memories", 3, include_sparse=False)
+    store.table = model.__table__
+    return store
+
+
+def _compiled_where_sql(store, filters):
+    from sqlalchemy.dialects import mysql
+
+    clause = store._generate_where_clause(filters)[0]
+    return str(
+        clause.compile(
+            dialect=mysql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+
+def test_oceanbase_where_clause_metadata_hash_targets_json_not_hash_column(
+    oceanbase_where_store,
+):
+    metadata_sql = _compiled_where_sql(
+        oceanbase_where_store,
+        {"metadata.hash": METADATA_HASH},
+    )
+    column_sql = _compiled_where_sql(
+        oceanbase_where_store,
+        {"hash": PAYLOAD_HASH},
+    )
+
+    assert metadata_sql != column_sql
+    assert "metadata" in metadata_sql
+    assert "hash" in metadata_sql
+
+
+def test_oceanbase_where_clause_document_column_for_text_content(
+    oceanbase_where_store,
+):
+    document_sql = _compiled_where_sql(
+        oceanbase_where_store,
+        {"document": COLLISION_CONTENT},
+    )
+    metadata_data_sql = _compiled_where_sql(
+        oceanbase_where_store,
+        {"metadata.data": METADATA_DATA},
+    )
+
+    assert "document" in document_sql
+    assert document_sql != metadata_data_sql
+
+
+def test_oceanbase_adapter_db_filters_use_document_for_payload_data():
+    adapter = _oceanbase_adapter()
+    store = adapter.vector_store
+    store.text_field = "document"
+
+    db_filters = adapter._build_db_filters(
+        filters={"payload.data": COLLISION_CONTENT, "metadata.hash": METADATA_HASH},
+        target_store=store,
+    )
+
+    assert db_filters == {
+        "document": COLLISION_CONTENT,
+        "metadata.hash": METADATA_HASH,
+    }
