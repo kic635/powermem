@@ -1,16 +1,10 @@
-"""Endpoint-level tests for /system/status dependency probes (Issue #1111).
-
-These tests run in the required PR test workflow (tests/unit/**). They exercise
-PR #1085 probe guarantees through the public HTTP endpoints rather than calling
-health_check helpers directly.
-"""
+"""Endpoint-level tests for /system/status dependency probes (Issue #1111)."""
 
 import asyncio
+import functools
 import json
-import sys
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -18,21 +12,40 @@ from server.config import config
 from server.models.response import DependencyStatus
 from server.utils import health_check
 
-_tests_root = Path(__file__).resolve().parents[2]
-if str(_tests_root) not in sys.path:
-    sys.path.insert(0, str(_tests_root))
-
-from helpers.status_dependency_probes import (  # noqa: E402
-    async_timeout,
-    async_client,
-    await_threading_event,
-    dependency_status,
-    isolated_dependency_probe_state,
-    status_endpoint_settings,
-    system_app,
-)
-
 pytestmark = pytest.mark.usefixtures("isolated_dependency_probe_state")
+
+
+def dependency_status(body: dict, name: str) -> dict:
+    data = body.get("data")
+    assert data is not None, f"response missing data: {body!r}"
+    dependencies = data.get("dependencies")
+    assert dependencies is not None, f"response missing dependencies: {body!r}"
+    dep = dependencies.get(name)
+    assert dep is not None, f"response missing dependency {name!r}: {body!r}"
+    return dep
+
+
+def async_timeout(seconds: float = 10):
+    def decorator(test_fn):
+        @functools.wraps(test_fn)
+        async def wrapper(*args, **kwargs):
+            return await asyncio.wait_for(test_fn(*args, **kwargs), timeout=seconds)
+
+        return wrapper
+
+    return decorator
+
+
+async def await_threading_event(event: threading.Event, timeout: float = 1.0) -> bool:
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, event.wait, timeout),
+            timeout=timeout + 0.1,
+        )
+    except asyncio.TimeoutError:
+        pass
+    return event.is_set()
 
 
 @pytest.mark.asyncio
@@ -198,7 +211,6 @@ async def test_status_dependency_cache_reuses_within_ttl_then_refreshes(
     assert second.status_code == 200
     assert calls == {"database": 1, "llm": 1}
 
-    # Expire the TTL with real wall-clock time, matching production cache behavior.
     await asyncio.sleep(0.11)
 
     third = await async_client.get("/api/v1/system/status")
@@ -212,7 +224,6 @@ async def test_status_endpoint_surfaces_cached_degraded_dependency(
     async_client,
     monkeypatch,
 ):
-    """Cached degraded dependency status and error_message are reused within TTL."""
     calls = {"database": 0, "llm": 0}
 
     def slow_database_probe():
@@ -252,7 +263,6 @@ async def test_status_endpoint_falls_back_when_dependency_probe_raises(
     async_client,
     monkeypatch,
 ):
-    """Probe failures should hit the /status fallback path without returning 500."""
     internal_error = "dependency probe failed"
 
     def exploding_database_probe():
@@ -273,13 +283,3 @@ async def test_status_endpoint_falls_back_when_dependency_probe_raises(
     assert body["data"]["status"] == "degraded"
     assert body["message"] != "System status retrieved successfully"
     assert internal_error not in json.dumps(body)
-
-
-__all__ = [
-    "test_blocked_status_probe_does_not_block_health_endpoint",
-    "test_status_dependency_probes_use_dedicated_executor_and_timeout_in_parallel",
-    "test_repeated_status_polls_reuse_blocked_database_probe",
-    "test_status_dependency_cache_reuses_within_ttl_then_refreshes",
-    "test_status_endpoint_surfaces_cached_degraded_dependency",
-    "test_status_endpoint_falls_back_when_dependency_probe_raises",
-]
