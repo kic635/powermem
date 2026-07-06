@@ -166,6 +166,7 @@ addopts = "-v --tb=short --strict-markers"
 markers = [
     "unit: Unit tests",
     "integration: Integration tests",
+    "regression: Endpoint and scenario regression tests",
     "e2e: End-to-end tests",
     "e2e_config: End-to-end tests requiring real configuration (not included in default test suite)",
     "api: Tests requiring external API credentials",

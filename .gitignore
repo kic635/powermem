@@ -171,6 +171,7 @@ cython_debug/
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+*.stackdump
 
 # Database files
 *.db
